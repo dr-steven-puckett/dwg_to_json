@@ -1,0 +1,22 @@
+# build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# compiled objects
+*.o
+*.a
+*.so
+*.exe
+
+# editor/temp files
+*.swp
+*.tmp
+*.log
+
+# JSON outputs from runs (but keep schema docs)
+*.json
+!docs/*.json
+
