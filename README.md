@@ -88,3 +88,48 @@ sudo apt install -y \
     build-essential \
     pkg-config \
     libdwg-dev libdwg-tools
+
+
+Building (Ubuntu / WSL)
+
+From inside the repo:
+
+# starting at the project root
+mkdir -p build
+cd build
+
+cmake ..
+make -j$(nproc)
+
+
+If everything succeeds, you should see a dwg_inspect executable in build/:
+
+ls
+# ...
+# dwg_inspect
+
+Usage
+
+Basic usage:
+
+./dwg_inspect path/to/file.dwg > file.json
+
+
+Example:
+
+./dwg_inspect ../tests/dwgs/sample.dwg > ../tests/expected/sample.json
+
+
+Input: sample.dwg
+
+Output: JSON printed to stdout, redirected to sample.json
+
+If the DWG cannot be read, the JSON will include an error field:
+
+{
+  "file": "path/to/file.dwg",
+  "schema_version": "1.0.0",
+  "libredwg_version": "0.x.x",
+  "error": "Failed to read DWG"
+}
+
