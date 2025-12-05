@@ -1,11 +1,7 @@
 #pragma once
-
 #include <string>
 #include <nlohmann/json.hpp>
 
-// Simple, stateless inspector API:
-//   DwgInspector inspector;
-//   nlohmann::json j = inspector.inspect("file.dwg");
 class DwgInspector {
 public:
     // Inspect the given DWG file and return a JSON object.
