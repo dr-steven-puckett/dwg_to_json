@@ -8,6 +8,7 @@
 #include <iostream>
 #include <cstdlib>  // free()
 #include <cstdio>   // snprintf for handle formatting
+#include <cctype>   // std::toupper for title_block scoring
 
 // LibreDWG is a C library; wrap includes in extern "C" for C++
 extern "C" {
@@ -20,8 +21,32 @@ using json = nlohmann::json;
 
 namespace {
 
+// Convert a DWG/LibreDWG char* (likely in the DWG codepage, often Latin-1/CP1252)
+// into a valid UTF-8 std::string. We treat bytes >= 0x80 as Latin-1 and
+// encode them as 2-byte UTF-8 sequences. This avoids json UTF-8 errors.
+std::string to_utf8_safe(const char* s) {
+    if (!s) {
+        return std::string();
+    }
+    std::string out;
+    out.reserve(std::strlen(s) + 8);  // small bias for multi-byte chars
+
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s);
+    while (*p) {
+        unsigned char c = *p++;
+        if (c < 0x80) {
+            // ASCII, copy as-is
+            out.push_back(static_cast<char>(c));
+        } else {
+            // Latin-1 -> UTF-8: 110xxxxx 10xxxxxx
+            out.push_back(static_cast<char>(0xC0 | (c >> 6)));
+            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        }
+    }
+    return out;
+}
+
 // Map DWG object type codes to human-readable names.
-// We accept a plain int so we don't depend on BITCODE_* typedefs.
 std::string entity_type_name(int type) {
     switch (type) {
         // Basic text & attributes
@@ -53,6 +78,8 @@ std::string entity_type_name(int type) {
         case DWG_TYPE_CIRCLE:                return "CIRCLE";
         case DWG_TYPE_ARC:                   return "ARC";
         case DWG_TYPE_POINT:                 return "POINT";
+
+        // Faces / solids / regions
         case DWG_TYPE__3DFACE:               return "3DFACE";   // note leading underscore
         case DWG_TYPE_SOLID:                 return "SOLID";
         case DWG_TYPE_TRACE:                 return "TRACE";
@@ -91,25 +118,21 @@ std::string entity_type_name(int type) {
         // Images / underlays / rasters
         case DWG_TYPE_IMAGE:                 return "IMAGE";
         case DWG_TYPE_PDFUNDERLAY:           return "PDFUNDERLAY";
-        // If your headers also define these, you can add them too:
-        // case DWG_TYPE_DGNUNDERLAY:        return "DGNUNDERLAY";
-        // case DWG_TYPE_DWFUNDERLAY:        return "DWFUNDERLAY";
         case DWG_TYPE_WIPEOUT:               return "WIPEOUT";
 
-        // Sectioning / visualization
-        case DWG_TYPE_SECTIONOBJECT:         return "SECTIONOBJECT";
-        case DWG_TYPE_LIGHT:                 return "LIGHT";
+        // Dictionaries, layout, etc.
+        case DWG_TYPE_LAYOUT:                return "LAYOUT";
+        case DWG_TYPE_DICTIONARY:            return "DICTIONARY";
+        case DWG_TYPE_DICTIONARYVAR:         return "DICTIONARYVAR";
+        case DWG_TYPE_GROUP:                 return "GROUP";
 
-        // Proxy / custom entities
-        case DWG_TYPE_PROXY_ENTITY:          return "PROXY_ENTITY";
-
-        // Fallback / unused
         case DWG_TYPE_UNUSED:                return "UNUSED";
 
         default:
             return "UNKNOWN";
     }
 }
+
 // Classify entities into coarse categories for downstream querying.
 std::string entity_category(int type) {
     switch (type) {
@@ -155,7 +178,7 @@ std::string entity_category(int type) {
         case DWG_TYPE_LARGE_RADIAL_DIMENSION:
             return "dimension";
 
-        // Block references
+        // Block references (inserts)
         case DWG_TYPE_INSERT:
         case DWG_TYPE_MINSERT:
             return "insert";
@@ -177,9 +200,7 @@ std::string entity_category(int type) {
     }
 }
 
-
 // Convert a Dwg_Handle to a hex string (e.g. "1A3").
-// If the handle is null or zero, returns an empty string.
 std::string handle_to_hex(const Dwg_Handle* h) {
     if (!h) {
         return std::string();
@@ -189,19 +210,22 @@ std::string handle_to_hex(const Dwg_Handle* h) {
         return std::string();
     }
     char buf[32];
-    std::snprintf(buf, sizeof(buf), "%llX", v);
-    return std::string(buf);
+    int len = std::snprintf(buf, sizeof(buf), "%llX", v);
+    if (len <= 0) {
+        return std::string();
+    }
+    return std::string(buf, static_cast<std::size_t>(len));
 }
 
-// Serialize a DWG layer to JSON.
+// Serialize a single LAYER object to JSON.
 json layer_to_json(const Dwg_Object_LAYER* layer) {
-    json j = json::object();
+    json j;
     if (!layer) {
         return j;
     }
 
     // Name
-    j["name"] = (layer->name ? layer->name : "");
+    j["name"] = layer->name ? to_utf8_safe(layer->name) : "";
 
     // Flags (frozen/locked/etc.)
     j["flags"] = static_cast<int>(layer->flag);
@@ -209,9 +233,6 @@ json layer_to_json(const Dwg_Object_LAYER* layer) {
     // Lineweight (in hundredths of mm in DWG; 0/255 have special meanings)
     j["lineweight"] = static_cast<int>(layer->linewt);
 
-    // Note: layer->color is BITCODE_CMC (_dwg_color), and layer->ltype is
-    // a BITCODE_H handle. Properly resolving these requires table lookups,
-    // so we omit them here for now to keep this serializer simple and stable.
     return j;
 }
 
@@ -239,7 +260,6 @@ void add_geometry(json& ent_json, Dwg_Object_Entity* ent, int raw_type) {
             end["y"] = ln->end.y;
             end["z"] = ln->end.z;
             geom["end"] = std::move(end);
-
             break;
         }
 
@@ -257,6 +277,57 @@ void add_geometry(json& ent_json, Dwg_Object_Entity* ent, int raw_type) {
             break;
         }
 
+        case DWG_TYPE_POINT: {
+            Dwg_Entity_POINT* p = ent->tio.POINT;
+            if (!p) break;
+
+            // POINT has x, y, z, thickness, x_ang
+            json pos;
+            pos["x"] = p->x;
+            pos["y"] = p->y;
+            pos["z"] = p->z;
+            geom["position"] = std::move(pos);
+
+            geom["thickness"] = p->thickness;
+            geom["x_ang"]     = p->x_ang;
+
+            break;
+        }
+
+        case DWG_TYPE_SOLID: {
+            Dwg_Entity_SOLID* s = ent->tio.SOLID;
+            if (!s) break;
+
+            // Four 2D corners (corner1..corner4) + elevation for Z
+            json vertices = json::array();
+
+            auto push_corner = [&vertices, s](const BITCODE_2RD& c) {
+                json v;
+                v["x"] = c.x;
+                v["y"] = c.y;
+                v["z"] = s->elevation;  // SOLID is 2D + elevation
+                vertices.push_back(std::move(v));
+            };
+
+            push_corner(s->corner1);
+            push_corner(s->corner2);
+            push_corner(s->corner3);
+            push_corner(s->corner4);
+
+            geom["vertices"]  = std::move(vertices);
+            geom["elevation"] = s->elevation;
+            geom["thickness"] = s->thickness;
+
+            // Extrusion direction (3D vector)
+            json ext;
+            ext["x"] = s->extrusion.x;
+            ext["y"] = s->extrusion.y;
+            ext["z"] = s->extrusion.z;
+            geom["extrusion"] = std::move(ext);
+
+            break;
+        }
+
         case DWG_TYPE_ARC: {
             Dwg_Entity_ARC* a = ent->tio.ARC;
             if (!a) break;
@@ -268,132 +339,256 @@ void add_geometry(json& ent_json, Dwg_Object_Entity* ent, int raw_type) {
             geom["center"] = std::move(center);
 
             geom["radius"] = a->radius;
-            // LibreDWG stores angles in radians
             geom["start_angle"] = a->start_angle;
             geom["end_angle"]   = a->end_angle;
             break;
         }
 
         case DWG_TYPE_TEXT: {
-            // Single-line TEXT
             Dwg_Entity_TEXT* t = ent->tio.TEXT;
             if (!t) break;
 
-            // Text string content
             if (t->text_value) {
-                ent_json["text"] = t->text_value;
+                ent_json["text"] = to_utf8_safe(t->text_value);
             }
 
-            // Insertion point: BITCODE_2DPOINT (x, y). We synthesize z = 0.0.
             json ins_pt;
             ins_pt["x"] = t->ins_pt.x;
             ins_pt["y"] = t->ins_pt.y;
             ins_pt["z"] = 0.0;
             geom["ins_pt"] = std::move(ins_pt);
 
-            // Nominal text height & rotation
             geom["height"]   = t->height;
             geom["rotation"] = t->rotation;
-
             break;
         }
 
         case DWG_TYPE_MTEXT: {
-            // Multi-line MTEXT
             Dwg_Entity_MTEXT* mt = ent->tio.MTEXT;
             if (!mt) break;
 
-            // MTEXT content
             if (mt->text) {
-                ent_json["text"] = mt->text;
+                ent_json["text"] = to_utf8_safe(mt->text);
             }
 
-            // Insertion point: ins_pt (likely BITCODE_2DPOINT)
             json ins_pt;
             ins_pt["x"] = mt->ins_pt.x;
             ins_pt["y"] = mt->ins_pt.y;
             ins_pt["z"] = 0.0;
             geom["ins_pt"] = std::move(ins_pt);
 
-            // Your Dwg_Entity_MTEXT in this LibreDWG build does not expose
-            // height/rotation with the expected names, so we omit them for now.
             break;
         }
 
-                case DWG_TYPE_INSERT: {
-            // Block reference (INSERT)
-            Dwg_Entity_INSERT* ins = ent->tio.INSERT;
-            if (!ins) break;
+        case DWG_TYPE_LEADER: {
+            Dwg_Entity_LEADER* ld = ent->tio.LEADER;
+            if (!ld) break;
 
-            // Insertion point: usually BITCODE_3BD
+            // Polyline points along the leader
+            json pts = json::array();
+            if (ld->num_points > 0 && ld->points) {
+                for (BITCODE_BL i = 0; i < ld->num_points; ++i) {
+                    json v;
+                    v["x"] = ld->points[i].x;
+                    v["y"] = ld->points[i].y;
+                    v["z"] = ld->points[i].z;
+                    pts.push_back(std::move(v));
+                }
+            }
+            geom["points"] = std::move(pts);
+
+            // Origin of the leader
+            {
+                json origin;
+                origin["x"] = ld->origin.x;
+                origin["y"] = ld->origin.y;
+                origin["z"] = ld->origin.z;
+                geom["origin"] = std::move(origin);
+            }
+
+            // Projected end point near the annotation
+            {
+                json endpt;
+                endpt["x"] = ld->endptproj.x;
+                endpt["y"] = ld->endptproj.y;
+                endpt["z"] = ld->endptproj.z;
+                geom["endptproj"] = std::move(endpt);
+            }
+
+            // Leader direction and text offset are useful for QA
+            {
+                json xdir;
+                xdir["x"] = ld->x_direction.x;
+                xdir["y"] = ld->x_direction.y;
+                xdir["z"] = ld->x_direction.z;
+                geom["x_direction"] = std::move(xdir);
+            }
+            {
+                json offs;
+                offs["x"] = ld->inspt_offset.x;
+                offs["y"] = ld->inspt_offset.y;
+                offs["z"] = ld->inspt_offset.z;
+                geom["inspt_offset"] = std::move(offs);
+            }
+
+            // A few scalar properties that will help later spell-check rules
+            geom["dimgap"]     = ld->dimgap;
+            geom["dimasz"]     = ld->dimasz;
+            geom["box_height"] = ld->box_height;
+            geom["box_width"]  = ld->box_width;
+            geom["arrowhead_on"] = (ld->arrowhead_on != 0);
+            geom["hookline_on"]  = (ld->hookline_on  != 0);
+
+            // Tagging leader type at the entity level
+            ent_json["path_type"]  = static_cast<int>(ld->path_type);
+            ent_json["annot_type"] = static_cast<int>(ld->annot_type);
+
+            break;
+        }
+
+        case DWG_TYPE_ATTRIB: {
+            Dwg_Entity_ATTRIB* a = ent->tio.ATTRIB;
+            if (!a) break;
+
+            // Tag + value
+            const char* tag_cstr = a->tag
+                ? reinterpret_cast<const char*>(a->tag)
+                : nullptr;
+            const char* val_cstr = a->text_value
+                ? reinterpret_cast<const char*>(a->text_value)
+                : nullptr;
+
+            if (tag_cstr && *tag_cstr) {
+                ent_json["tag"] = to_utf8_safe(tag_cstr);
+            }
+            if (val_cstr) {
+                // Keep consistent with TEXT/MTEXT by using "text" for content
+                ent_json["text"] = to_utf8_safe(val_cstr);
+            }
+
+            // Basic placement / size
             {
                 json ins_pt;
-                ins_pt["x"] = ins->ins_pt.x;
-                ins_pt["y"] = ins->ins_pt.y;
-                ins_pt["z"] = ins->ins_pt.z;
+                ins_pt["x"] = a->ins_pt.x;
+                ins_pt["y"] = a->ins_pt.y;
+                ins_pt["z"] = 0.0;  // 2D export; elevation is available separately if needed
                 geom["ins_pt"] = std::move(ins_pt);
             }
 
-            // Scale factors: BITCODE_3BD scale (x, y, z)
-            {
-                json scale;
-                scale["x"] = ins->scale.x;
-                scale["y"] = ins->scale.y;
-                scale["z"] = ins->scale.z;
-                geom["scale"] = std::move(scale);
-            }
+            geom["height"]   = a->height;
+            geom["rotation"] = a->rotation;
 
-            // Rotation angle (radians)
-            geom["rotation"] = ins->rotation;
-
-            // Note: We’re not yet resolving the referenced block name here.
-            // That requires walking the block table / block_header handle,
-            // which we can add later once CadSentinel’s block strategy is fixed.
+            // Useful metadata for later rules / spell-checking
+            ent_json["flags"]          = static_cast<int>(a->flags);
+            ent_json["lock_position"]  = (a->lock_position_flag != 0);
 
             break;
         }
 
+        case DWG_TYPE_ATTDEF: {
+            Dwg_Entity_ATTDEF* ad = ent->tio.ATTDEF;
+            if (!ad) break;
+
+            // Tag + definition details
+            const char* tag_cstr = ad->tag
+                ? reinterpret_cast<const char*>(ad->tag)
+                : nullptr;
+            const char* def_cstr = ad->default_value
+                ? reinterpret_cast<const char*>(ad->default_value)
+                : nullptr;
+            const char* prompt_cstr = ad->prompt
+                ? reinterpret_cast<const char*>(ad->prompt)
+                : nullptr;
+
+            if (tag_cstr && *tag_cstr) {
+                ent_json["tag"] = to_utf8_safe(tag_cstr);
+            }
+            if (def_cstr) {
+                ent_json["default_value"] = to_utf8_safe(def_cstr);
+            }
+            if (prompt_cstr) {
+                ent_json["prompt"] = to_utf8_safe(prompt_cstr);
+            }
+
+            // Basic placement / size
+            {
+                json ins_pt;
+                ins_pt["x"] = ad->ins_pt.x;
+                ins_pt["y"] = ad->ins_pt.y;
+                ins_pt["z"] = 0.0;
+                geom["ins_pt"] = std::move(ins_pt);
+            }
+
+            geom["height"]   = ad->height;
+            geom["rotation"] = ad->rotation;
+
+            // Metadata
+            ent_json["flags"]          = static_cast<int>(ad->flags);
+            ent_json["lock_position"]  = (ad->lock_position_flag != 0);
+
+            break;
+        }
+
+            case DWG_TYPE_INSERT: {
+        Dwg_Entity_INSERT* ins = ent->tio.INSERT;
+        if (!ins) break;
+
+        // Block name referenced by this INSERT
+        if (ins->block_name) {
+            ent_json["block_name"] =
+                to_utf8_safe(reinterpret_cast<const char*>(ins->block_name));
+        }
+
+        {
+            json ins_pt;
+            ins_pt["x"] = ins->ins_pt.x;
+            ins_pt["y"] = ins->ins_pt.y;
+            ins_pt["z"] = ins->ins_pt.z;
+            geom["ins_pt"] = std::move(ins_pt);
+        }
+        {
+            json scale;
+            scale["x"] = ins->scale.x;
+            scale["y"] = ins->scale.y;
+            scale["z"] = ins->scale.z;
+            geom["scale"] = std::move(scale);
+        }
+        geom["rotation"] = ins->rotation;
+        break;
+    }
+
+
         case DWG_TYPE_LWPOLYLINE: {
-            // Lightweight 2D polyline
             Dwg_Entity_LWPOLYLINE* lw = ent->tio.LWPOLYLINE;
             if (!lw) break;
 
             json vertices = json::array();
-
-            // LibreDWG: BITCODE_BL num_points; BITCODE_2DPOINT *points;
-            if (lw->points && lw->num_points > 0) {
-                for (BITCODE_BL i = 0; i < lw->num_points; ++i) {
+            if (lw->num_points > 0 && lw->points) {
+                for (int i = 0; i < static_cast<int>(lw->num_points); ++i) {
                     json v;
                     v["x"] = lw->points[i].x;
                     v["y"] = lw->points[i].y;
-                    v["z"] = 0.0;  // 2D polyline, so z = 0.0
+                    v["z"] = 0.0;
                     vertices.push_back(std::move(v));
                 }
             }
-
             geom["vertices"] = std::move(vertices);
 
-            // Closed flag: bit 0 set → closed.
             bool closed = (lw->flag & 0x01) != 0;
             geom["closed"] = closed;
-
             break;
         }
 
         case DWG_TYPE_DIMENSION_LINEAR: {
-            // Linear dimension: use LibreDWG's _dwg_entity_DIMENSION_LINEAR layout
             Dwg_Entity_DIMENSION_LINEAR* dl = ent->tio.DIMENSION_LINEAR;
             if (!dl) break;
 
-            // Top-level text: override / explicit dim text
             if (dl->user_text) {
-                ent_json["text"] = dl->user_text;
+                ent_json["text"] = to_utf8_safe(dl->user_text);
             }
 
-            // Top-level value: stored/actual measurement
             ent_json["value"] = dl->act_measurement;
 
-            // Definition points
             json def_pt;
             def_pt["x"] = dl->def_pt.x;
             def_pt["y"] = dl->def_pt.y;
@@ -415,19 +610,251 @@ void add_geometry(json& ent_json, Dwg_Object_Entity* ent, int raw_type) {
             def_points["xline2"]  = std::move(xline2);
             geom["definition_points"] = std::move(def_points);
 
-            // Text position: text_midpt is BITCODE_2RD (x, y); z from elevation
             json text_pos;
             text_pos["x"] = dl->text_midpt.x;
             text_pos["y"] = dl->text_midpt.y;
-            text_pos["z"] = dl->elevation;
+            text_pos["z"] = 0.0;
             geom["text_position"] = std::move(text_pos);
 
-            // Orientation angles (radians)
             geom["dim_rotation"]  = dl->dim_rotation;
             geom["text_rotation"] = dl->text_rotation;
 
             break;
         }
+
+        case DWG_TYPE_DIMENSION_ORDINATE: {
+            Dwg_Entity_DIMENSION_ORDINATE* d = ent->tio.DIMENSION_ORDINATE;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            // Origin / definition point
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+
+            // Feature location (where the leader hits the feature)
+            json feat_pt;
+            feat_pt["x"] = d->feature_location_pt.x;
+            feat_pt["y"] = d->feature_location_pt.y;
+            feat_pt["z"] = d->feature_location_pt.z;
+
+            json def_points;
+            def_points["def_pt"]            = std::move(def_pt);
+            def_points["feature_location"]  = std::move(feat_pt);
+            geom["definition_points"]       = std::move(def_points);
+
+            // Text placement
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+
+            break;
+        }
+
+        case DWG_TYPE_DIMENSION_ALIGNED: {
+            Dwg_Entity_DIMENSION_ALIGNED* d = ent->tio.DIMENSION_ALIGNED;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            // Definition point on dimension line
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+            geom["def_pt"] = std::move(def_pt);
+
+            // Text placement
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+            geom["horiz_dir"]     = d->horiz_dir;
+
+            break;
+        }
+
+        case DWG_TYPE_DIMENSION_ANG3PT: {
+            Dwg_Entity_DIMENSION_ANG3PT* d = ent->tio.DIMENSION_ANG3PT;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+            geom["def_pt"] = std::move(def_pt);
+
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+            geom["horiz_dir"]     = d->horiz_dir;
+
+            break;
+        }
+
+        case DWG_TYPE_DIMENSION_ANG2LN: {
+            Dwg_Entity_DIMENSION_ANG2LN* d = ent->tio.DIMENSION_ANG2LN;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+            geom["def_pt"] = std::move(def_pt);
+
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+            geom["horiz_dir"]     = d->horiz_dir;
+
+            break;
+        }
+
+        case DWG_TYPE_DIMENSION_RADIUS: {
+            Dwg_Entity_DIMENSION_RADIUS* d = ent->tio.DIMENSION_RADIUS;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+            geom["def_pt"] = std::move(def_pt);
+
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+
+            break;
+        }
+
+        case DWG_TYPE_DIMENSION_DIAMETER: {
+            Dwg_Entity_DIMENSION_DIAMETER* d = ent->tio.DIMENSION_DIAMETER;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+            geom["def_pt"] = std::move(def_pt);
+
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+
+            break;
+        }
+
+        case DWG_TYPE_ARC_DIMENSION: {
+            Dwg_Entity_ARC_DIMENSION* d = ent->tio.ARC_DIMENSION;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+            geom["def_pt"] = std::move(def_pt);
+
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+
+            break;
+        }
+
+        case DWG_TYPE_LARGE_RADIAL_DIMENSION: {
+            Dwg_Entity_LARGE_RADIAL_DIMENSION* d = ent->tio.LARGE_RADIAL_DIMENSION;
+            if (!d) break;
+
+            if (d->user_text) {
+                ent_json["text"] = to_utf8_safe(d->user_text);
+            }
+
+            ent_json["value"] = d->act_measurement;
+
+            json def_pt;
+            def_pt["x"] = d->def_pt.x;
+            def_pt["y"] = d->def_pt.y;
+            def_pt["z"] = d->def_pt.z;
+            geom["def_pt"] = std::move(def_pt);
+
+            json text_pos;
+            text_pos["x"] = d->text_midpt.x;
+            text_pos["y"] = d->text_midpt.y;
+            text_pos["z"] = 0.0;
+            geom["text_position"] = std::move(text_pos);
+
+            geom["text_rotation"] = d->text_rotation;
+
+            break;
+        }
+
 
         default:
             break;
@@ -438,6 +865,186 @@ void add_geometry(json& ent_json, Dwg_Object_Entity* ent, int raw_type) {
     }
 }
 
+
+// Extract a candidate title block INSERT and its attributes from the DWG.
+json extract_title_block(const Dwg_Data& dwg) {
+    json result;
+    result["found"] = false;
+    result["block_name"] = nullptr;
+    result["handle"] = nullptr;
+    result["layer"] = nullptr;
+    result["geometry"] = json::object();
+    result["attributes"] = json::object();
+
+    json candidates = json::array();
+    std::unordered_map<std::string, std::size_t> handle_to_index;
+
+    const std::size_t nobj = static_cast<std::size_t>(dwg.num_objects);
+
+    // First pass: collect INSERT candidates with basic geometry.
+    for (std::size_t i = 0; i < nobj; ++i) {
+        Dwg_Object* obj = &dwg.object[i];
+
+        if (obj->supertype != DWG_SUPERTYPE_ENTITY) {
+            continue;
+        }
+        if (obj->type != DWG_TYPE_INSERT) {
+            continue;
+        }
+        if (!obj->tio.entity || !obj->tio.entity->tio.INSERT) {
+            continue;
+        }
+        Dwg_Entity_INSERT* ins = obj->tio.entity->tio.INSERT;
+
+        json cand = json::object();
+
+        // Handle as DWG hex string
+        std::string handle_hex = handle_to_hex(&obj->handle);
+        if (handle_hex.empty()) {
+            continue; // we rely on handles for ATTRIB association
+        }
+        cand["handle"] = handle_hex;
+
+        // Layer name
+        const char* layer_name = nullptr;
+        Dwg_Object_LAYER* layer = dwg_get_entity_layer(obj->tio.entity);
+        if (layer && layer->name) {
+            layer_name = layer->name;
+        }
+        if (layer_name) {
+            cand["layer"] = to_utf8_safe(layer_name);
+        } else {
+            cand["layer"] = nullptr;
+        }
+
+        // Block name (BITCODE_TV)
+        std::string block_name;
+        if (ins->block_name) {
+            block_name = to_utf8_safe(reinterpret_cast<const char*>(ins->block_name));
+        }
+        cand["block_name"] = block_name;
+
+        // Basic geometry
+        json geom = json::object();
+        {
+            json ins_pt;
+            ins_pt["x"] = ins->ins_pt.x;
+            ins_pt["y"] = ins->ins_pt.y;
+            ins_pt["z"] = ins->ins_pt.z;
+            geom["ins_pt"] = std::move(ins_pt);
+        }
+        {
+            json scale;
+            scale["x"] = ins->scale.x;
+            scale["y"] = ins->scale.y;
+            scale["z"] = ins->scale.z;
+            geom["scale"] = std::move(scale);
+        }
+        geom["rotation"] = ins->rotation;
+        cand["geometry"] = std::move(geom);
+
+        cand["attributes"] = json::object();
+
+        std::size_t idx = candidates.size();
+        candidates.push_back(std::move(cand));
+        handle_to_index.emplace(std::move(handle_hex), idx);
+    }
+
+    // Second pass: attach ATTRIBs to the owning INSERT via owner handle.
+    for (std::size_t i = 0; i < nobj; ++i) {
+        Dwg_Object* obj = &dwg.object[i];
+
+        if (obj->supertype != DWG_SUPERTYPE_ENTITY) {
+            continue;
+        }
+        if (obj->type != DWG_TYPE_ATTRIB) {
+            continue;
+        }
+        if (!obj->tio.entity || !obj->tio.entity->tio.ATTRIB) {
+            continue;
+        }
+        Dwg_Entity_ATTRIB* a = obj->tio.entity->tio.ATTRIB;
+
+        std::string owner_hex;
+        if (obj->tio.entity->ownerhandle) {
+            owner_hex = handle_to_hex(&obj->tio.entity->ownerhandle->handleref);
+        }
+        if (owner_hex.empty()) {
+            continue;
+        }
+
+        auto it = handle_to_index.find(owner_hex);
+        if (it == handle_to_index.end()) {
+            continue;
+        }
+
+        json& cand  = candidates[it->second];
+        json& attrs = cand["attributes"];
+
+        const char* tag_cstr = a->tag
+            ? reinterpret_cast<const char*>(a->tag)
+            : nullptr;
+        const char* val_cstr = a->text_value
+            ? reinterpret_cast<const char*>(a->text_value)
+            : nullptr;
+
+        if (tag_cstr && *tag_cstr) {
+            std::string tag = to_utf8_safe(tag_cstr);
+            std::string val = val_cstr ? to_utf8_safe(val_cstr) : std::string();
+            attrs[tag] = val;
+        }
+    }
+
+    result["candidates"] = candidates;
+
+    // Choose best candidate
+    int best_index = -1;
+    int best_score = 0;
+
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const json& c = candidates[i];
+        if (!c.contains("block_name") || !c["block_name"].is_string()) {
+            continue;
+        }
+        const std::string name = c["block_name"].get<std::string>();
+        std::string upper;
+        upper.reserve(name.size());
+        for (unsigned char ch : name) {
+            upper.push_back(static_cast<char>(std::toupper(ch)));
+        }
+
+        bool has_title  = (upper.find("TITLE")  != std::string::npos);
+        bool has_block  = (upper.find("BLOCK")  != std::string::npos);
+        bool has_border = (upper.find("BORDER") != std::string::npos);
+
+        int score = 0;
+        if (has_title)  score += 3;
+        if (has_block)  score += 2;
+        if (has_border) score += 1;
+
+        if (c.contains("attributes") && c["attributes"].is_object()) {
+            score += static_cast<int>(c["attributes"].size());
+        }
+
+        if (score > best_score) {
+            best_score = score;
+            best_index = static_cast<int>(i);
+        }
+    }
+
+    if (best_index >= 0) {
+        const json& best = candidates[static_cast<std::size_t>(best_index)];
+        result["found"]      = true;
+        result["block_name"] = best.value("block_name", "");
+        result["handle"]     = best.value("handle", json(nullptr));
+        result["layer"]      = best.value("layer", json(nullptr));
+        result["geometry"]   = best.value("geometry", json::object());
+        result["attributes"] = best.value("attributes", json::object());
+    }
+
+    return result;
+}
+
 } // namespace
 
 
@@ -445,7 +1052,6 @@ json DwgInspector::inspect(const std::string& dwg_path) {
     Dwg_Data dwg;
     std::memset(&dwg, 0, sizeof(Dwg_Data));
 
-    // Read DWG file using LibreDWG
     int err = dwg_read_file(dwg_path.c_str(), &dwg);
     if (err >= DWG_ERR_CRITICAL) {
         throw std::runtime_error(
@@ -457,14 +1063,24 @@ json DwgInspector::inspect(const std::string& dwg_path) {
     json root;
 
     // Basic file & library info
-    root["file"] = dwg_path;
-    root["schema_version"] = "1.0.0";  // CadSentinel schema version
+    // Clean input filename by stripping leading/trailing single or double quotes
+    std::string clean_path = dwg_path;
+    if (!clean_path.empty()) {
+        if ((clean_path.front() == '"'  && clean_path.back() == '"') ||
+            (clean_path.front() == '\'' && clean_path.back() == '\'')) 
+        {
+            clean_path = clean_path.substr(1, clean_path.size() - 2);
+        }
+    }
+
+    root["file"] = clean_path;
+    root["schema_version"] = "1.1.0";  // title_block + UTF-8-safe text
     root["libredwg_version"] = {
         {"major", LIBREDWG_VERSION_MAJOR},
         {"minor", LIBREDWG_VERSION_MINOR}
     };
 
-    // Header information (version, codepage, extents)
+    // Header (basic)
     json header;
     header["version"]  = static_cast<int>(dwg.header.version);
     header["codepage"] = static_cast<int>(dwg.header.codepage);
@@ -486,7 +1102,7 @@ json DwgInspector::inspect(const std::string& dwg_path) {
 
     root["header"] = header;
 
-    // === Layers table ===
+    // Layers
     json layers = json::array();
     BITCODE_BL layer_count = dwg_get_layer_count(&dwg);
     if (layer_count > 0) {
@@ -494,29 +1110,66 @@ json DwgInspector::inspect(const std::string& dwg_path) {
         if (layer_array) {
             for (BITCODE_BL i = 0; i < layer_count; ++i) {
                 Dwg_Object_LAYER* layer = layer_array[i];
-                if (!layer) {
-                    continue;
-                }
+                if (!layer) continue;
                 layers.push_back(layer_to_json(layer));
             }
-            // dwg_get_layers allocates the array; caller is responsible for freeing
             free(layer_array);
         }
     }
     root["layers"] = layers;
 
-    // === Entity listing + counts ===
+    // First pass: collect BLOCK definitions (handle -> name) for blocks table
+        // First pass: collect BLOCK definitions (handle -> name) for blocks table
+    std::unordered_map<std::string, std::string> block_definitions;
+
+    for (std::size_t i = 0; i < static_cast<std::size_t>(dwg.num_objects); ++i) {
+        Dwg_Object* obj = &dwg.object[i];
+
+        if (obj->supertype != DWG_SUPERTYPE_ENTITY) {
+            continue;
+        }
+        if (obj->type != DWG_TYPE_BLOCK) {
+            continue;
+        }
+        if (!obj->tio.entity || !obj->tio.entity->tio.BLOCK) {
+            continue;
+        }
+
+        Dwg_Entity_BLOCK* blk = obj->tio.entity->tio.BLOCK;
+
+        // BLOCK name is BITCODE_TV, effectively a char* in this struct
+        const char* name_cstr = blk->name
+            ? reinterpret_cast<const char*>(blk->name)
+            : nullptr;
+
+        if (!name_cstr || !*name_cstr) {
+            continue;
+        }
+
+        std::string name = to_utf8_safe(name_cstr);
+        if (name.empty()) {
+            continue;
+        }
+
+        std::string handle_hex = handle_to_hex(&obj->handle);
+        if (handle_hex.empty()) {
+            continue;
+        }
+
+        block_definitions.emplace(std::move(handle_hex), std::move(name));
+    }
+
+    // Entities + summary
     json entities = json::array();
     std::unordered_map<std::string, std::size_t> type_counts;
     std::unordered_map<std::string, std::size_t> category_counts;
     std::unordered_map<std::string, std::size_t> layer_counts;
-
+    std::unordered_map<std::string, std::size_t> block_counts;
     std::size_t entity_count = 0;
 
     for (std::size_t i = 0; i < static_cast<std::size_t>(dwg.num_objects); ++i) {
         Dwg_Object* obj = &dwg.object[i];
 
-        // Only keep true ENTITIES (ignore tables, dictionaries, etc.)
         if (obj->supertype != DWG_SUPERTYPE_ENTITY) {
             continue;
         }
@@ -524,8 +1177,7 @@ json DwgInspector::inspect(const std::string& dwg_path) {
         ++entity_count;
 
         const int raw_type = static_cast<int>(obj->type);
-
-        const std::string type_name = entity_type_name(static_cast<int>(obj->type));
+        const std::string type_name = entity_type_name(raw_type);
         ++type_counts[type_name];
 
         json ent;
@@ -534,15 +1186,12 @@ json DwgInspector::inspect(const std::string& dwg_path) {
         ent["raw_type"]  = raw_type;
         ent["supertype"] = static_cast<int>(obj->supertype);
 
-        // New: coarse category for easier downstream querying
         ent["category"]  = entity_category(raw_type);
-
         {
             const std::string cat = ent["category"].get<std::string>();
             ++category_counts[cat];
         }
 
-        // Layer name for this entity (if resolvable)
         const char* layer_name = nullptr;
         if (obj->tio.entity) {
             Dwg_Object_Entity* ent_header = obj->tio.entity;
@@ -552,24 +1201,21 @@ json DwgInspector::inspect(const std::string& dwg_path) {
             }
         }
         if (layer_name) {
-            ent["layer"] = layer_name;
+            ent["layer"] = to_utf8_safe(layer_name);
         } else {
             ent["layer"] = nullptr;
         }
 
-        // Count by layer (use "<null>" for entities without a resolved layer)
         {
-            std::string layer_key;
-            if (ent["layer"].is_null()) {
-                layer_key = "<null>";
+            std::string layer_key = layer_name ? layer_name : std::string("<null>");
+            auto it = layer_counts.find(layer_key);
+            if (it == layer_counts.end()) {
+                layer_counts[layer_key] = 1;
             } else {
-                layer_key = ent["layer"].get<std::string>();
+                ++(it->second);
             }
-            ++layer_counts[layer_key];
         }
 
-
-        // Handle of this entity (as DWG hex string, e.g. "1A3").
         {
             std::string handle_hex = handle_to_hex(&obj->handle);
             if (!handle_hex.empty()) {
@@ -579,7 +1225,6 @@ json DwgInspector::inspect(const std::string& dwg_path) {
             }
         }
 
-        // Owner handle (DXF 330), when available.
         {
             std::string owner_hex;
             if (obj->tio.entity && obj->tio.entity->ownerhandle) {
@@ -592,14 +1237,31 @@ json DwgInspector::inspect(const std::string& dwg_path) {
             }
         }
 
-        // Geometry & text/content for supported types
-                // Geometry & text/content for supported types
-        add_geometry(ent, obj->tio.entity, static_cast<int>(obj->type));
+        add_geometry(ent, obj->tio.entity, raw_type);
+
+        // Accumulate block usage based on INSERT entities
+        if (ent.contains("block_name") && ent["block_name"].is_string()) {
+            const std::string bname = ent["block_name"].get<std::string>();
+            if (!bname.empty()) {
+                ++block_counts[bname];
+            }
+        }
 
         entities.push_back(std::move(ent));
     }
 
     root["entities"] = entities;
+
+    // Blocks table (summary of blocks used via INSERTs)
+    json blocks = json::array();
+    for (const auto& kv : block_counts) {
+        json blk;
+        blk["name"]        = kv.first;
+        blk["num_inserts"] = static_cast<std::uint64_t>(kv.second);
+        blocks.push_back(std::move(blk));
+    }
+    root["blocks"] = std::move(blocks);
+
 
     json summary;
     summary["num_objects"]        = static_cast<std::uint64_t>(dwg.num_objects);
@@ -607,12 +1269,10 @@ json DwgInspector::inspect(const std::string& dwg_path) {
     summary["entity_type_counts"] = type_counts;
     summary["category_counts"]    = category_counts;
     summary["layer_counts"]       = layer_counts;
+    root["summary"]               = summary;
 
-    root["summary"] = summary;
+    root["title_block"] = extract_title_block(dwg);
 
-
-    // Always free before returning
     dwg_free(&dwg);
-
     return root;
 }
