@@ -153,6 +153,9 @@ std::string entity_category(int type) {
         case DWG_TYPE_SHAPE:
         case DWG_TYPE_RAY:
             return "curve";
+        case DWG_TYPE_POINT:
+            return "curve";
+
 
         // Text / annotation
         case DWG_TYPE_TEXT:
@@ -1118,8 +1121,7 @@ json DwgInspector::inspect(const std::string& dwg_path) {
     }
     root["layers"] = layers;
 
-    // First pass: collect BLOCK definitions (handle -> name) for blocks table
-        // First pass: collect BLOCK definitions (handle -> name) for blocks table
+    // First pass: collect BLOCK definitions (handle -> name)
     std::unordered_map<std::string, std::string> block_definitions;
 
     for (std::size_t i = 0; i < static_cast<std::size_t>(dwg.num_objects); ++i) {
@@ -1137,7 +1139,7 @@ json DwgInspector::inspect(const std::string& dwg_path) {
 
         Dwg_Entity_BLOCK* blk = obj->tio.entity->tio.BLOCK;
 
-        // BLOCK name is BITCODE_TV, effectively a char* in this struct
+        // BLOCK.name is BITCODE_TV (char*), convert to UTF-8
         const char* name_cstr = blk->name
             ? reinterpret_cast<const char*>(blk->name)
             : nullptr;
@@ -1151,6 +1153,7 @@ json DwgInspector::inspect(const std::string& dwg_path) {
             continue;
         }
 
+        // Use the same handle format as entities[]
         std::string handle_hex = handle_to_hex(&obj->handle);
         if (handle_hex.empty()) {
             continue;
@@ -1164,7 +1167,6 @@ json DwgInspector::inspect(const std::string& dwg_path) {
     std::unordered_map<std::string, std::size_t> type_counts;
     std::unordered_map<std::string, std::size_t> category_counts;
     std::unordered_map<std::string, std::size_t> layer_counts;
-    std::unordered_map<std::string, std::size_t> block_counts;
     std::size_t entity_count = 0;
 
     for (std::size_t i = 0; i < static_cast<std::size_t>(dwg.num_objects); ++i) {
@@ -1239,29 +1241,57 @@ json DwgInspector::inspect(const std::string& dwg_path) {
 
         add_geometry(ent, obj->tio.entity, raw_type);
 
-        // Accumulate block usage based on INSERT entities
-        if (ent.contains("block_name") && ent["block_name"].is_string()) {
-            const std::string bname = ent["block_name"].get<std::string>();
-            if (!bname.empty()) {
-                ++block_counts[bname];
-            }
-        }
-
         entities.push_back(std::move(ent));
     }
 
     root["entities"] = entities;
 
-    // Blocks table (summary of blocks used via INSERTs)
+        // Build blocks[] summary:
+    // One entry per BLOCK definition, listing child entities in that block.
     json blocks = json::array();
-    for (const auto& kv : block_counts) {
+
+    for (const auto& kv : block_definitions) {
+        const std::string& block_handle = kv.first;
+        const std::string& block_name   = kv.second;
+
         json blk;
-        blk["name"]        = kv.first;
-        blk["num_inserts"] = static_cast<std::uint64_t>(kv.second);
+        blk["name"]   = block_name;
+        blk["handle"] = block_handle;
+
+        json entity_indexes = json::array();
+        json entity_handles = json::array();
+
+        // Find entities whose owner_handle == this BLOCK handle
+        for (const auto& ent : entities) {
+            if (!ent.contains("owner_handle") || ent["owner_handle"].is_null()) {
+                continue;
+            }
+            if (!ent["owner_handle"].is_string()) {
+                continue;
+            }
+            const std::string owner = ent["owner_handle"].get<std::string>();
+            if (owner == block_handle) {
+                // DWG object index (already exported as "index")
+                entity_indexes.push_back(ent["index"]);
+
+                // Entity handle (if present)
+                if (ent.contains("handle") && ent["handle"].is_string()) {
+                    entity_handles.push_back(ent["handle"]);
+                } else {
+                    entity_handles.push_back(nullptr);
+                }
+            }
+        }
+
+        blk["entity_indexes"] = std::move(entity_indexes);
+        blk["entity_handles"] = std::move(entity_handles);
+        blk["num_entities"]   =
+            static_cast<std::uint64_t>(blk["entity_indexes"].size());
+
         blocks.push_back(std::move(blk));
     }
-    root["blocks"] = std::move(blocks);
 
+    root["blocks"] = std::move(blocks);
 
     json summary;
     summary["num_objects"]        = static_cast<std::uint64_t>(dwg.num_objects);
