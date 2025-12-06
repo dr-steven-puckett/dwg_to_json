@@ -1,5 +1,6 @@
 #include "dwg_inspector.hpp"
 #include <iostream>
+#include <string>
 
 int main(int argc, char** argv) {
     if (argc < 2) {

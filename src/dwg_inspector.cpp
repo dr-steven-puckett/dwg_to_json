@@ -152,24 +152,21 @@ std::string entity_category(int type) {
         case DWG_TYPE_TRACE:
         case DWG_TYPE_SHAPE:
         case DWG_TYPE_RAY:
+        case DWG_TYPE_POINT:   // if you added this earlier
             return "curve";
-        case DWG_TYPE_POINT:
-            return "curve";
-
 
         // Text / annotation
         case DWG_TYPE_TEXT:
         case DWG_TYPE_ATTRIB:
         case DWG_TYPE_ATTDEF:
         case DWG_TYPE_MTEXT:
-        case DWG_TYPE_LEADER:
         case DWG_TYPE_MULTILEADER:
         case DWG_TYPE_TOLERANCE:
         case DWG_TYPE_MLINE:
         case DWG_TYPE_TABLE:
             return "text";
 
-        // Dimensions
+        // Dimensions (including LEADER now)
         case DWG_TYPE_DIMENSION_ORDINATE:
         case DWG_TYPE_DIMENSION_LINEAR:
         case DWG_TYPE_DIMENSION_ALIGNED:
@@ -179,6 +176,7 @@ std::string entity_category(int type) {
         case DWG_TYPE_DIMENSION_DIAMETER:
         case DWG_TYPE_ARC_DIMENSION:
         case DWG_TYPE_LARGE_RADIAL_DIMENSION:
+        case DWG_TYPE_LEADER:    // <- moved here
             return "dimension";
 
         // Block references (inserts)
@@ -202,6 +200,7 @@ std::string entity_category(int type) {
             return "other";
     }
 }
+
 
 // Convert a Dwg_Handle to a hex string (e.g. "1A3").
 std::string handle_to_hex(const Dwg_Handle* h) {
@@ -863,9 +862,39 @@ void add_geometry(json& ent_json, Dwg_Object_Entity* ent, int raw_type) {
             break;
     }
 
-    if (!geom.empty()) {
-        ent_json["geometry"] = std::move(geom);
+        // Normalize geometry schema: derive a generic "points" array when possible
+        if (!geom.empty()) {
+            // If no "points" yet, try to infer them from other keys
+            if (!geom.contains("points")) {
+                json pts = json::array();
+
+                // 1) LINE: start + end → 2 points
+                if (geom.contains("start") && geom.contains("end")) {
+                    pts.push_back(geom["start"]);
+                    pts.push_back(geom["end"]);
+                }
+                // 2) Any entity with "vertices" (LWPOLYLINE, SOLID, etc.)
+                else if (geom.contains("vertices") && geom["vertices"].is_array()) {
+                    pts = geom["vertices"];
+                }
+                // 3) POINT-like entities with a single "position"
+                else if (geom.contains("position")) {
+                    pts.push_back(geom["position"]);
+                }
+                // 4) As a fallback for some text/dimension entities, you could
+                //    choose to expose a single representative point later
+                //    (e.g., ins_pt or text_position), but we keep it conservative
+                //    for now to avoid guessing.
+
+                if (!pts.empty()) {
+                    geom["points"] = std::move(pts);
+                }
+            }
+
+            ent_json["geometry"] = std::move(geom);
+        }
     }
+
 }
 
 
@@ -1046,8 +1075,6 @@ json extract_title_block(const Dwg_Data& dwg) {
     }
 
     return result;
-}
-
 } // namespace
 
 
