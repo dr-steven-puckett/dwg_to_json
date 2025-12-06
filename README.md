@@ -191,5 +191,4 @@ The C++ portion is complete and stable for that workflow.
 
 ## License
 
-Internal use for the CadSentinel project.  
 LibreDWG is GPLv3; this component must comply accordingly.
