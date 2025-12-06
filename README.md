@@ -1,135 +1,208 @@
-# CadSentinel – DWG Inspect (v1.0)
+CadSentinel DWG Inspector
 
-CadSentinel’s **DWG Inspect** (`dwg_inspect`) is a C++ command-line tool that reads AutoCAD DWG files using **LibreDWG** and exports a structured **JSON** representation of the drawing.
+DWG → JSON Extraction Tool (v1.1)
+Built using LibreDWG and C++17
 
-This JSON is the **canonical contract** for downstream tooling (databases, embeddings, ASTM “spell checker”, etc.). Version **1.0.0** focuses on robust extraction of core DWG entities and metadata.
+Overview
 
----
+This tool extracts all relevant geometric, annotation, layer, block, and metadata information from an AutoCAD DWG file and exports it as a structured JSON document.
 
-## Features (v1.0.0)
+It is designed for CadSentinel, where a downstream Python ETL pipeline ingests the JSON and performs:
 
-- Reads DWG files via **LibreDWG**
-- Outputs pretty-printed **JSON** to `stdout`
-- Includes:
-  - File metadata:
-    - `file`
-    - `schema_version`
-    - `libredwg_version`
-  - `header` information:
-    - DWG version
-    - Codepage
-    - Model/paper extents (as available)
-  - `layers[]`:
-    - `name`
-    - `flags`
-    - `lineweight`
-  - `entities[]`:
-    - `index`
-    - `type` (human-readable type name)
-    - `raw_type` (integer)
-    - `supertype` (integer)
-    - `category` (e.g. `curve`, `text`, `dimension`, `insert`, `block`, `image`, `other`)
-    - `layer`
-    - `handle`, `owner_handle`
-    - Optional `text`
-    - Optional `value`
-    - Optional `geometry` object (type-specific fields)
-  - `summary`:
-    - `num_objects`
-    - `num_entities`
-    - `entity_type_counts`
-    - `category_counts`
-    - `layer_counts`
+Standards “spell checking” against ASTM/ISO/GD&T definitions
 
-This JSON schema is documented in:
+Symbol/geometry validation
 
-- `docs/dwg_inspect_schema_v1.0.0.md`
-- `docs/dwg_inspect_schema_v1.0.0.json`
+Rule-based QA
 
----
+Vector embedding + database indexing
 
-## Roadmap (v1.1+)
+Drawing search and AI-assisted analysis
 
-Planned enhancements for **v1.1.0** (ASTM-focused):
+This C++ program has one job only:
 
-- Add a top-level **`title_block`** object:
-  - `found`, `layout`, `block_name`
-  - Insertion transform (`ins_pt`, `scale`, `rotation`)
-  - Title block attributes (`DWG_NO`, `PART_NO`, `TITLE`, `REV`, `MATERIAL`, `FINISH`, etc.)
-  - Static notes text within the title block (e.g., default tolerances, units)
-- Harden and extend **dimension** entity geometry (especially `DIMENSION_LINEAR`)
-- Enrich `header` with units and default dimension style
+Read a DWG file using LibreDWG and output a complete JSON representation to stdout.
 
-Architectural-specific data (rooms, doors, windows, grids, etc.) will be part of a **future 2.x** line and is out of scope for v1.x.
+DXF conversion, PNG export, thumbnails, or PDF generation are not part of this module (those are handled later by the Python layer).
 
----
+Features (v1.1)
+✔ DWG Entity Extraction
 
-## Requirements
+Lines, circles, arcs, ellipses
 
-### System
+Lightweight polylines
 
-- Ubuntu (including **WSL2 Ubuntu**)
-- C++17-capable compiler:
-  - `g++` (via `build-essential`)
-- CMake 3.15+ recommended
+Text (TEXT, MTEXT, ATTRIB, ATTDEF)
 
-### Libraries
+Dimensions (linear, aligned, angular, radial, diameter, ordinate, arc, large-radius)
 
-- **LibreDWG** (and headers)
-- **nlohmann::json** (header-only library)
+Solids, 3DFACE, traces
 
-On Ubuntu, you can start with:
+INSERTS and MINSERTS
 
-```bash
-sudo apt update
-sudo apt install -y \
-    git \
-    cmake \
-    build-essential \
-    pkg-config \
-    libdwg-dev libdwg-tools
+Leaders & Multileaders
+
+Images, underlays, rasters
+
+Tables, hatches, polygons
+
+✔ UTF-8 Safe Text Handling
+
+DWG files often store text in Latin-1 / CP1252.
+This tool safely converts all such strings to UTF-8 to avoid JSON serialization issues.
+
+✔ Geometry Extraction
+
+Standardized geometry schema per entity:
+
+Points arrays (start/end, vertices, positions)
+
+Radii, angles, heights, rotations
+
+Insertion points, scale, extrusion vectors
+
+Dimension definition points & text positions
+
+✔ Layer + Block Summary
+
+Layer metadata:
+
+Name, flags (frozen/locked), lineweight
+
+Block definitions:
+
+Block name
+
+Handle
+
+Member entity indexes + handles
+
+✔ Title Block Detection
+
+A heuristic identifies the likely title block insert, scoring based on:
+
+Block name keywords ("TITLE", "BLOCK", "BORDER")
+
+Attributes present (more attributes → higher score)
+
+Block definition handle matching
+Full attributes & geometry are included in the JSON.
+
+✔ Full File Summary
+
+Entity counts by type
+
+Category counts
+
+Layer usage counts
+
+DWG version and codepage
+
+Extents (model and paper space)
+
+Output Format
+
+Running:
+
+./dwg_inspect drawing.dwg
 
 
-Building (Ubuntu / WSL)
+Produces prettified JSON:
 
-From inside the repo:
+{
+  "file": "drawing.dwg",
+  "schema_version": "1.1.0",
+  "libredwg_version": { "major": 0, "minor": 12 },
+  "header": {
+    "version": 27,
+    "codepage": 1252,
+    "extents": { ... }
+  },
+  "layers": [ ... ],
+  "blocks": [ ... ],
+  "entities": [ ... ],
+  "summary": { ... },
+  "title_block": { ... }
+}
 
-# starting at the project root
-mkdir -p build
+
+The Python ETL will capture this via stdout and ingest into CadSentinel’s database.
+
+Build Instructions
+Requirements
+
+LibreDWG (libredwg + libredwg-dev)
+
+CMake ≥ 3.10
+
+C++17 compiler
+
+nlohmann/json (header-only)
+
+Build
+mkdir build
 cd build
-
 cmake ..
-make -j$(nproc)
+cmake --build .
 
 
-If everything succeeds, you should see a dwg_inspect executable in build/:
+This produces:
 
-ls
-# ...
-# dwg_inspect
+./dwg_inspect
 
 Usage
-
-Basic usage:
-
-./dwg_inspect path/to/file.dwg > file.json
+./dwg_inspect <file.dwg> > output.json
 
 
 Example:
 
-./dwg_inspect ../tests/dwgs/sample.dwg > ../tests/expected/sample.json
+./dwg_inspect gearbox.dwg > gearbox.json
 
 
-Input: sample.dwg
+If DWG loading fails:
 
-Output: JSON printed to stdout, redirected to sample.json
+Error: dwg_read_file failed for 'gearbox.dwg' with error code X
 
-If the DWG cannot be read, the JSON will include an error field:
+Project Structure
+/src
+   main.cpp
+   dwg_inspector.cpp
+/include
+   dwg_inspector.hpp
+CMakeLists.txt
+README.md   ← (this file)
 
-{
-  "file": "path/to/file.dwg",
-  "schema_version": "1.0.0",
-  "libredwg_version": "0.x.x",
-  "error": "Failed to read DWG"
-}
+Notes on v1.1 Design Philosophy
 
+No DXF conversion inside C++
+
+No internal LibreDWG headers (bits.h, dwg_bits.h, out_dxf.h)
+
+Uses only the stable public API: dwg.h, dwg_api.h
+
+JSON-only output; no file writing
+
+Safe across Linux / macOS LibreDWG installations
+
+Perfect fit for Python ingestion + rule-based validation
+
+Roadmap for v1.2 (Python-side)
+
+This C++ extractor connects to a planned Python layer that will:
+
+Convert DWG → DXF (via dwg2dxf)
+
+Generate PNG, thumbnails, and PDF
+
+Store JSON + vector embeddings in Postgres/pgvector
+
+Apply ASTM/GD&T rule maps for “spell checking”
+
+Provide an AI search interface via FastAPI
+
+The C++ portion is complete and stable for that workflow.
+
+License
+
+Internal use for the CadSentinel project.
+LibreDWG is GPLv3; this component must comply accordingly.
